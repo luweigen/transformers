@@ -26,6 +26,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 """
 
 import math
+import re
 from typing import Any, List, Optional, Tuple, Union
 
 import torch
@@ -993,6 +994,28 @@ class IQuestLoopCoderPreTrainedModel(PreTrainedModel):
     _skip_keys_device_placement = ["past_key_values"]
     _supports_cache_class = True
     _supports_static_cache = True
+
+    def __init__(self, config):
+        super().__init__(config)
+        # Register hook to rename weights before loading
+        self._register_load_state_dict_pre_hook(self._rename_gate_projection_weights)
+
+    @staticmethod
+    def _rename_gate_projection_weights(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """Rename gate_projections.X to layers.X.gate_projection for backward compatibility."""
+        keys_to_rename = {}
+        for key in list(state_dict.keys()):
+            if "gate_projections." in key:
+                # model.gate_projections.0.weight -> model.layers.0.gate_projection.weight
+                match = re.match(r"(.*)gate_projections\.(\d+)\.(weight|bias)", key)
+                if match:
+                    prefix_part, layer_idx, param_type = match.groups()
+                    new_key = f"{prefix_part}layers.{layer_idx}.gate_projection.{param_type}"
+                    keys_to_rename[key] = new_key
+
+        for old_key, new_key in keys_to_rename.items():
+            if old_key in state_dict:
+                state_dict[new_key] = state_dict.pop(old_key)
 
     def _init_weights(self, module):
         std = self.config.initializer_range
