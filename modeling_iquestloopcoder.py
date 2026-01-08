@@ -25,6 +25,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
+import json
 import math
 import re
 from typing import Any, List, Optional, Tuple, Union
@@ -995,18 +996,22 @@ class IQuestLoopCoderPreTrainedModel(PreTrainedModel):
     _supports_cache_class = True
     _supports_static_cache = True
 
-    def __init__(self, config):
-        super().__init__(config)
-        # Register hook to rename weights before loading
-        self._register_load_state_dict_pre_hook(self._rename_gate_projection_weights)
+    # Weight name mapping for backward compatibility
+    # Maps old checkpoint names to new model structure names
+    _keys_to_rename = {
+        # Pattern: (old_pattern, new_pattern)
+        # model.gate_projections.X.weight -> model.layers.X.gate_projection.weight
+    }
 
-    @staticmethod
-    def _rename_gate_projection_weights(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        """Rename gate_projections.X to layers.X.gate_projection for backward compatibility."""
+    @classmethod
+    def _rename_state_dict_keys(cls, state_dict):
+        """Rename keys in state_dict from old format to new format.
+
+        Maps: model.gate_projections.X.weight/bias -> model.layers.X.gate_projection.weight/bias
+        """
         keys_to_rename = {}
         for key in list(state_dict.keys()):
             if "gate_projections." in key:
-                # model.gate_projections.0.weight -> model.layers.0.gate_projection.weight
                 match = re.match(r"(.*)gate_projections\.(\d+)\.(weight|bias)", key)
                 if match:
                     prefix_part, layer_idx, param_type = match.groups()
@@ -1016,6 +1021,148 @@ class IQuestLoopCoderPreTrainedModel(PreTrainedModel):
         for old_key, new_key in keys_to_rename.items():
             if old_key in state_dict:
                 state_dict[new_key] = state_dict.pop(old_key)
+
+        return state_dict
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        """Load pretrained model with automatic weight name remapping.
+
+        This method handles backward compatibility for checkpoints that have
+        gate_projections at model level (model.gate_projections.X.weight)
+        instead of within each layer (model.layers.X.gate_projection.weight).
+        """
+        # Call parent's from_pretrained
+        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+
+        # Post-load weight remapping for backward compatibility
+        # Handles checkpoints with model.gate_projections.X.weight format
+        cls._remap_gate_projection_weights(model, pretrained_model_name_or_path)
+
+        return model
+
+    @classmethod
+    def _remap_gate_projection_weights(cls, model, pretrained_model_name_or_path):
+        """Remap gate_projections weights from old format to new format after loading.
+
+        Old format: model.gate_projections.X.weight/bias
+        New format: model.layers.X.gate_projection.weight/bias
+        """
+        import os
+
+        if not os.path.isdir(pretrained_model_name_or_path):
+            return
+
+        # Check for sharded safetensors index
+        index_file = os.path.join(pretrained_model_name_or_path, "model.safetensors.index.json")
+        is_safetensors = True
+        if not os.path.exists(index_file):
+            index_file = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin.index.json")
+            is_safetensors = False
+
+        if not os.path.exists(index_file):
+            # Try single-file checkpoint
+            single_file = os.path.join(pretrained_model_name_or_path, "model.safetensors")
+            if os.path.exists(single_file):
+                cls._load_gate_weights_from_safetensors(model, single_file)
+            return
+
+        # Load index to find gate_projections weights
+        with open(index_file, "r") as f:
+            index = json.load(f)
+
+        weight_map = index.get("weight_map", {})
+        old_keys = [k for k in weight_map.keys() if "gate_projections." in k]
+
+        if not old_keys:
+            return
+
+        # Group by shard file
+        shard_to_keys = {}
+        for key in old_keys:
+            shard = weight_map[key]
+            if shard not in shard_to_keys:
+                shard_to_keys[shard] = []
+            shard_to_keys[shard].append(key)
+
+        # Load weights from each shard
+        for shard_name, keys in shard_to_keys.items():
+            shard_path = os.path.join(pretrained_model_name_or_path, shard_name)
+            if is_safetensors:
+                cls._load_gate_weights_from_safetensors(model, shard_path, keys)
+            else:
+                cls._load_gate_weights_from_pytorch(model, shard_path, keys)
+
+    @classmethod
+    def _load_gate_weights_from_safetensors(cls, model, shard_path, keys=None):
+        """Load gate_projection weights from a safetensors file."""
+        try:
+            from safetensors import safe_open
+        except ImportError:
+            return
+
+        with safe_open(shard_path, framework="pt") as f:
+            available_keys = f.keys()
+            if keys is None:
+                keys = [k for k in available_keys if "gate_projections." in k]
+
+            for old_key in keys:
+                if old_key not in available_keys:
+                    continue
+
+                # Parse: model.gate_projections.X.weight -> model.layers.X.gate_projection.weight
+                match = re.match(r"(.*)gate_projections\.(\d+)\.(weight|bias)", old_key)
+                if not match:
+                    continue
+
+                prefix_part, layer_idx, param_type = match.groups()
+                layer_idx = int(layer_idx)
+
+                # Get tensor from checkpoint
+                tensor = f.get_tensor(old_key)
+
+                # Copy to model's layer
+                cls._copy_weight_to_layer(model, layer_idx, param_type, tensor)
+
+    @classmethod
+    def _load_gate_weights_from_pytorch(cls, model, shard_path, keys=None):
+        """Load gate_projection weights from a pytorch file."""
+        import torch
+
+        state_dict = torch.load(shard_path, map_location="cpu")
+        if keys is None:
+            keys = [k for k in state_dict.keys() if "gate_projections." in k]
+
+        for old_key in keys:
+            if old_key not in state_dict:
+                continue
+
+            match = re.match(r"(.*)gate_projections\.(\d+)\.(weight|bias)", old_key)
+            if not match:
+                continue
+
+            prefix_part, layer_idx, param_type = match.groups()
+            layer_idx = int(layer_idx)
+
+            tensor = state_dict[old_key]
+            cls._copy_weight_to_layer(model, layer_idx, param_type, tensor)
+
+    @classmethod
+    def _copy_weight_to_layer(cls, model, layer_idx, param_type, tensor):
+        """Copy a weight tensor to the appropriate layer's gate_projection."""
+        # Navigate to model.model.layers[layer_idx].gate_projection
+        try:
+            if hasattr(model, "model"):
+                layers = model.model.layers
+            else:
+                layers = model.layers
+
+            if layer_idx < len(layers):
+                gate_proj = layers[layer_idx].gate_projection
+                param = getattr(gate_proj, param_type)
+                param.data.copy_(tensor.to(param.device))
+        except (AttributeError, IndexError):
+            pass  # Silently skip if structure doesn't match
 
     def _init_weights(self, module):
         std = self.config.initializer_range
