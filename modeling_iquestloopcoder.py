@@ -307,15 +307,21 @@ class IQuestLoopCoderRotaryEmbedding(nn.Module):
     @torch.no_grad()
     def forward(self, x, position_ids):
         # x: [batch_size, num_heads, seq_len, head_dim]
-        # Multi-GPU: ensure inv_freq is on the same device as input
+        # Multi-GPU: ensure all tensors are on the same device as input x
+        target_device = x.device
+
         inv_freq = self.inv_freq
-        if inv_freq.device != x.device:
-            inv_freq = inv_freq.to(x.device)
+        if inv_freq.device != target_device:
+            inv_freq = inv_freq.to(target_device)
+
+        # Ensure position_ids is on the same device
+        if position_ids.device != target_device:
+            position_ids = position_ids.to(target_device)
 
         inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
 
-        device_type = x.device.type
+        device_type = target_device.type
         with torch.autocast(device_type=device_type, enabled=False):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
@@ -448,6 +454,11 @@ class IQuestLoopCoderAttention(nn.Module):
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
+        device = hidden_states.device
+
+        # Multi-GPU: ensure attention_mask is on the same device
+        if attention_mask is not None and attention_mask.device != device:
+            attention_mask = attention_mask.to(device)
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
@@ -507,6 +518,11 @@ class IQuestLoopCoderAttention(nn.Module):
             Attention output [batch, seq_len, num_heads, head_dim]
         """
         bsz, q_len, _ = hidden_states.size()
+        device = hidden_states.device
+
+        # Multi-GPU: ensure attention_mask is on the same device
+        if attention_mask is not None and attention_mask.device != device:
+            attention_mask = attention_mask.to(device)
 
         # Compute Q from current hidden states
         query_states = self.q_proj(hidden_states)
@@ -606,6 +622,11 @@ class IQuestLoopCoderAttention(nn.Module):
             v1: Current value [batch, num_kv_heads, 1, head_dim] (only current token)
         """
         bsz, q_len, _ = hidden_states.size()
+        device = hidden_states.device
+
+        # Multi-GPU: ensure attention_mask is on the same device
+        if attention_mask is not None and attention_mask.device != device:
+            attention_mask = attention_mask.to(device)
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
@@ -687,6 +708,10 @@ class IQuestLoopCoderAttention(nn.Module):
         """
         bsz, q_len, _ = hidden_states.size()
         device = hidden_states.device
+
+        # Multi-GPU: ensure attention_mask is on the same device
+        if attention_mask is not None and attention_mask.device != device:
+            attention_mask = attention_mask.to(device)
 
         # Get Q2, K2, V2 for current loop
         q2, k2, v2 = self.get_qkv(hidden_states, position_ids)
@@ -848,6 +873,11 @@ class IQuestLoopCoderDecoderLayer(nn.Module):
             output hidden states, gate mean value
         """
         device = hidden_states.device
+
+        # Multi-GPU: ensure attention_mask is on the same device
+        if attention_mask is not None and attention_mask.device != device:
+            attention_mask = attention_mask.to(device)
+
         residual = hidden_states
         hidden_states_normed = self.input_layernorm(hidden_states)
 
