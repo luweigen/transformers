@@ -872,22 +872,26 @@ class IQuestLoopCoderDecoderLayer(nn.Module):
         Returns:
             output hidden states, gate mean value
         """
-        device = hidden_states.device
+        # Multi-GPU: Get the actual device of this layer (not from hidden_states which may be on wrong device)
+        # This is necessary because forward_loop2_mixed is called directly, bypassing accelerate's hooks
+        layer_device = next(self.parameters()).device
 
-        # Multi-GPU: ensure attention_mask is on the same device
-        if attention_mask is not None and attention_mask.device != device:
-            attention_mask = attention_mask.to(device)
+        # Multi-GPU: Move all inputs to this layer's device
+        if hidden_states.device != layer_device:
+            hidden_states = hidden_states.to(layer_device)
+        if attention_mask is not None and attention_mask.device != layer_device:
+            attention_mask = attention_mask.to(layer_device)
+        if position_ids is not None and position_ids.device != layer_device:
+            position_ids = position_ids.to(layer_device)
+        if k1.device != layer_device:
+            k1 = k1.to(layer_device)
+            v1 = v1.to(layer_device)
 
         residual = hidden_states
         hidden_states_normed = self.input_layernorm(hidden_states)
 
         # Get Q2, K2, V2 for current loop
         q2, k2, v2 = self.self_attn.get_qkv(hidden_states_normed, position_ids)
-
-        # Multi-GPU: ensure k1, v1 are on the same device as current layer
-        if k1.device != device:
-            k1 = k1.to(device)
-            v1 = v1.to(device)
 
         # Compute gate using integrated gate_projection (same device as layer)
         gate = self.gate_projection(q2)  # [batch, num_heads, seq_len, 1]
@@ -1135,9 +1139,20 @@ class IQuestLoopCoderModel(IQuestLoopCoderPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            # Multi-GPU: Get the actual device of this layer and move inputs
+            # This is necessary because we call get_qkv directly, bypassing accelerate's hooks
+            layer_device = next(decoder_layer.parameters()).device
+            if hidden_states.device != layer_device:
+                hidden_states = hidden_states.to(layer_device)
+            if causal_mask is not None and causal_mask.device != layer_device:
+                causal_mask = causal_mask.to(layer_device)
+            layer_position_ids = position_ids
+            if position_ids is not None and position_ids.device != layer_device:
+                layer_position_ids = position_ids.to(layer_device)
+
             # Get K1, V1 before standard forward (from original hidden_states, after layernorm)
             hidden_states_normed = decoder_layer.input_layernorm(hidden_states)
-            q1, k1, v1 = decoder_layer.self_attn.get_qkv(hidden_states_normed, position_ids)
+            q1, k1, v1 = decoder_layer.self_attn.get_qkv(hidden_states_normed, layer_position_ids)
 
             # Store K1, V1 for Loop 2+ (on the same device as this layer)
             layer_k1v1[layer_idx] = (k1, v1)
@@ -1146,11 +1161,11 @@ class IQuestLoopCoderModel(IQuestLoopCoderPreTrainedModel):
             if use_cache:
                 next_decoder_cache.update_shared(k1, v1, layer_idx)
 
-            # Standard forward
+            # Standard forward (accelerate hooks will handle device transfer)
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
-                position_ids=position_ids,
+                position_ids=layer_position_ids,
                 past_key_value=None,
                 output_attentions=output_attentions,
                 use_cache=False,
@@ -1264,8 +1279,20 @@ class IQuestLoopCoderModel(IQuestLoopCoderPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            # Get past shared KV cache (move to current layer's device)
+            # Multi-GPU: Get the actual device of this layer and move all inputs
             layer_device = next(decoder_layer.parameters()).device
+            if hidden_states.device != layer_device:
+                hidden_states = hidden_states.to(layer_device)
+            if causal_mask is not None and causal_mask.device != layer_device:
+                causal_mask = causal_mask.to(layer_device)
+            layer_position_ids = position_ids
+            if position_ids is not None and position_ids.device != layer_device:
+                layer_position_ids = position_ids.to(layer_device)
+            layer_cache_position = cache_position
+            if cache_position is not None and cache_position.device != layer_device:
+                layer_cache_position = cache_position.to(layer_device)
+
+            # Get past shared KV cache (move to current layer's device)
             past_shared_key, past_shared_value = None, None
             if next_decoder_cache is not None:
                 past_shared_key, past_shared_value = next_decoder_cache.get_shared(layer_idx, target_device=layer_device)
@@ -1276,8 +1303,8 @@ class IQuestLoopCoderModel(IQuestLoopCoderPreTrainedModel):
                 past_shared_key=past_shared_key,
                 past_shared_value=past_shared_value,
                 attention_mask=causal_mask,
-                position_ids=position_ids,
-                cache_position=cache_position,
+                position_ids=layer_position_ids,
+                cache_position=layer_cache_position,
             )
 
             # Store current token's K1, V1 for Loop 2+
@@ -1301,12 +1328,25 @@ class IQuestLoopCoderModel(IQuestLoopCoderPreTrainedModel):
         # ============ Loop 2 to loop_num: Mixed attention ============
         for loop_idx in range(2, self.loop_num + 1):
             for layer_idx, decoder_layer in enumerate(self.layers):
+                # Multi-GPU: Get the actual device of this layer and move all inputs
                 layer_device = next(decoder_layer.parameters()).device
+                if hidden_states.device != layer_device:
+                    hidden_states = hidden_states.to(layer_device)
+                if causal_mask is not None and causal_mask.device != layer_device:
+                    causal_mask = causal_mask.to(layer_device)
+                layer_position_ids = position_ids
+                if position_ids is not None and position_ids.device != layer_device:
+                    layer_position_ids = position_ids.to(layer_device)
 
                 # Get k1, v1 (current token's Loop 1 KV)
                 k1_current, v1_current = loop1_k1v1[layer_idx]
                 if k1_current is None or v1_current is None:
                     continue
+
+                # Move k1, v1 to layer device if needed
+                if k1_current.device != layer_device:
+                    k1_current = k1_current.to(layer_device)
+                    v1_current = v1_current.to(layer_device)
 
                 # Get full shared KV and past local KV from cache
                 k1_full, v1_full = None, None
@@ -1326,7 +1366,7 @@ class IQuestLoopCoderModel(IQuestLoopCoderPreTrainedModel):
                     past_local_value=past_local_value,
                     gate_proj=decoder_layer.gate_projection,
                     attention_mask=causal_mask,
-                    position_ids=position_ids,
+                    position_ids=layer_position_ids,
                     loop_window_size=self.loop_window_size,
                 )
 
